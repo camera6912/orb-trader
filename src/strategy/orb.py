@@ -10,10 +10,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time
-from typing import Optional, Tuple
+from enum import Enum
+from typing import Optional
 
 import pandas as pd
 import pytz
+from loguru import logger
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,209 @@ class ORBPlan:
     short_entry: float
     short_stop: float
     short_target: float
+
+
+class ORBState(str, Enum):
+    """Simple time-based state machine for opening range capture."""
+
+    WAITING_FOR_OPEN = "waiting"  # Before 09:30
+    BUILDING_RANGE = "building"  # 09:30–09:45
+    RANGE_COMPLETE = "complete"  # After 09:45
+
+
+class ORBTracker:
+    """Tracks /ES opening range (09:30–09:45 ET) from live quotes.
+
+    Designed to be driven by a main loop calling `update()`.
+
+    Edge cases handled:
+      - If the process starts after 09:30, seeds range from Schwab minute history.
+      - Validates quote timestamps to avoid using stale data.
+      - Uses pytz America/New_York for all session cutoffs.
+    """
+
+    def __init__(
+        self,
+        schwab_client,
+        symbol: str = "/ES",
+        market_open: str = "09:30",
+        range_end: str = "09:45",
+        tz: str = "America/New_York",
+        poll_interval_s: float = 2.0,
+        max_stale_s: int = 30,
+    ):
+        self.schwab = schwab_client
+        self.symbol = symbol
+        self.market_open = market_open
+        self.range_end = range_end
+        self.tz = tz
+        self.poll_interval_s = float(poll_interval_s)
+        self.max_stale_s = int(max_stale_s)
+
+        self.state: ORBState = ORBState.WAITING_FOR_OPEN
+
+        self.range_high: Optional[float] = None
+        self.range_low: Optional[float] = None
+        self.range_size: Optional[float] = None
+        self.range_midpoint: Optional[float] = None
+
+        self._opening_range: Optional[OpeningRange] = None
+        self._last_quote_ts: Optional[datetime] = None
+        self._seeded_from_history: bool = False
+
+    def _eastern_tz(self):
+        return pytz.timezone(self.tz)
+
+    def _session_times(self, now_e: datetime) -> tuple[datetime, datetime]:
+        d = now_e.date()
+        eastern = self._eastern_tz()
+        start = eastern.localize(datetime.combine(d, time.fromisoformat(self.market_open)))
+        end = eastern.localize(datetime.combine(d, time.fromisoformat(self.range_end)))
+        return start, end
+
+    def _compute_derived(self):
+        if self.range_high is None or self.range_low is None:
+            return
+        self.range_size = float(self.range_high - self.range_low)
+        self.range_midpoint = float((self.range_high + self.range_low) / 2.0)
+
+    def opening_range(self) -> Optional[OpeningRange]:
+        return self._opening_range
+
+    def update(self, now: Optional[datetime] = None) -> ORBState:
+        """Advance state machine and update range from quotes/history."""
+        now_e = _as_eastern(now or datetime.now(), self.tz)
+        start, end = self._session_times(now_e)
+
+        # State transitions
+        if now_e < start:
+            self.state = ORBState.WAITING_FOR_OPEN
+            return self.state
+
+        if start <= now_e < end:
+            if self.state != ORBState.BUILDING_RANGE:
+                logger.info(f"ORB: entering BUILDING_RANGE ({start:%H:%M}–{end:%H:%M} {self.tz})")
+            self.state = ORBState.BUILDING_RANGE
+
+            # If we started late, seed range from history once.
+            if not self._seeded_from_history:
+                self._seed_from_history(now_e=now_e, window_end=min(now_e, end))
+                self._seeded_from_history = True
+
+            # Pull live quote + update high/low.
+            self._update_from_quote(now_e)
+            return self.state
+
+        # now_e >= end
+        if self.state != ORBState.RANGE_COMPLETE:
+            self._finalize_from_history(now_e=now_e, start=start, end=end)
+            self.state = ORBState.RANGE_COMPLETE
+        return self.state
+
+    def _quote_timestamp(self, raw: dict) -> Optional[datetime]:
+        """Extract a quote timestamp from Schwab quote payload (ms since epoch)."""
+        q = raw.get("quote", {})
+        ms = q.get("quoteTimeInLong") or q.get("tradeTimeInLong")
+        if not ms:
+            return None
+        ts_utc = datetime.fromtimestamp(int(ms) / 1000.0, tz=pytz.UTC)
+        return ts_utc.astimezone(self._eastern_tz())
+
+    def _update_from_quote(self, now_e: datetime) -> None:
+        try:
+            if self.symbol == "/ES":
+                quotes = self.schwab.get_quotes(["/ES"])
+                # Schwab resolves /ES -> /ESH26 etc.
+                raw = next((v for v in quotes.values() if v.get("assetMainType") == "FUTURE"), None)
+                if not raw:
+                    raise RuntimeError("No FUTURE quote returned for /ES")
+                price = float(raw.get("quote", {}).get("lastPrice", 0.0))
+                qts = self._quote_timestamp(raw)
+            else:
+                raw_all = self.schwab.get_quote(self.symbol)
+                raw = raw_all.get(self.symbol, {})
+                price = float(raw.get("quote", {}).get("lastPrice", 0.0))
+                qts = self._quote_timestamp(raw)
+
+            if price <= 0:
+                return
+
+            if qts is not None:
+                age = (now_e - qts).total_seconds()
+                if age > self.max_stale_s:
+                    logger.warning(f"ORB: stale quote ignored (age={age:.1f}s, ts={qts.isoformat()})")
+                    return
+                self._last_quote_ts = qts
+
+            if self.range_high is None or price > self.range_high:
+                self.range_high = price
+            if self.range_low is None or price < self.range_low:
+                self.range_low = price
+            self._compute_derived()
+        except Exception as e:
+            logger.exception(f"ORB: quote update failed: {e}")
+
+    def _seed_from_history(self, now_e: datetime, window_end: datetime) -> None:
+        """Seed high/low from minute history for [open, window_end)."""
+        try:
+            candles = self.schwab.get_price_history(
+                symbol=self.symbol,
+                period_type="day",
+                period=1,
+                frequency_type="minute",
+                frequency=1,
+            )
+            if candles.empty:
+                return
+
+            eastern = self._eastern_tz()
+            if candles.index.tz is None:
+                candles.index = candles.index.tz_localize(pytz.UTC)
+            candles_e = candles.copy()
+            candles_e.index = candles_e.index.tz_convert(eastern)
+
+            start, _ = self._session_times(now_e)
+            window = candles_e.loc[(candles_e.index >= start) & (candles_e.index < window_end)]
+            if window.empty:
+                return
+
+            self.range_high = float(window["high"].max())
+            self.range_low = float(window["low"].min())
+            self._compute_derived()
+            logger.info(
+                f"ORB: seeded from history up to {window_end:%H:%M:%S} high={self.range_high:.2f} low={self.range_low:.2f}"
+            )
+        except Exception as e:
+            logger.exception(f"ORB: seeding from history failed: {e}")
+
+    def _finalize_from_history(self, now_e: datetime, start: datetime, end: datetime) -> None:
+        """Finalize opening range at 09:45 using minute history as the source of truth."""
+        candles = self.schwab.get_price_history(
+            symbol=self.symbol,
+            period_type="day",
+            period=1,
+            frequency_type="minute",
+            frequency=1,
+        )
+        opening_range = compute_opening_range(
+            candles=candles,
+            trade_date=now_e,
+            market_open=self.market_open,
+            range_end=self.range_end,
+            tz=self.tz,
+        )
+
+        self._opening_range = opening_range
+        self.range_high = opening_range.high
+        self.range_low = opening_range.low
+        self._compute_derived()
+
+        logger.info(
+            "ORB RANGE COMPLETE: "
+            f"high={opening_range.high:.2f} low={opening_range.low:.2f} "
+            f"size={opening_range.size:.2f} mid={opening_range.mid:.2f} "
+            f"({start:%H:%M}–{end:%H:%M} {self.tz})"
+        )
 
 
 def _as_eastern(dt: datetime, tz: str = "US/Eastern") -> datetime:
@@ -88,11 +293,12 @@ def compute_opening_range(
         raise ValueError("No candles provided")
 
     idx = candles.index
-    if idx.tz is None:
-        raise ValueError("Candles index must be timezone-aware")
-
-    # Schwab history often returns UTC; normalize to Eastern for slicing.
+    # Schwab history uses epoch ms and is effectively UTC; the DataFrame often
+    # arrives as tz-naive. Assume UTC in that case.
     candles_e = candles.copy()
+    if idx.tz is None:
+        candles_e.index = candles_e.index.tz_localize(pytz.UTC)
+    # Normalize to Eastern for slicing.
     candles_e.index = candles_e.index.tz_convert(eastern)
 
     window = candles_e.loc[(candles_e.index >= start) & (candles_e.index < end)]

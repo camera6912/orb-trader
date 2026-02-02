@@ -22,7 +22,7 @@ import yaml
 from loguru import logger
 
 from src.data.schwab import SchwabClient
-from src.strategy.orb import compute_opening_range, build_orb_plan
+from src.strategy.orb import ORBTracker, ORBState, build_orb_plan
 from src.trading.paper import PaperBroker
 
 
@@ -68,6 +68,16 @@ def main():
 
     broker = PaperBroker()
 
+    tracker = ORBTracker(
+        schwab_client=schwab,
+        symbol=symbol,
+        market_open=market_open,
+        range_end=range_end,
+        tz="America/New_York",
+        poll_interval_s=2.0,
+        max_stale_s=30,
+    )
+
     oco_placed = False
     bracket_attached = False
     be_done = False
@@ -85,39 +95,24 @@ def main():
             time_mod.sleep(5)
             continue
 
-        # After market open but before range_end: keep updating range calculation cache
-        if t >= _t(market_open) and t < _t(range_end):
-            # We compute on-demand at range_end.
-            pass
+        # Drive ORB tracker state machine (handles seeding from history + live polling)
+        state = tracker.update(now)
 
-        # At/after range_end, compute OR and place OCO once
-        if (not oco_placed) and t >= _t(range_end):
+        # Once the range is complete, build plan + place OCO exactly once
+        if (not oco_placed) and state == ORBState.RANGE_COMPLETE:
             try:
-                candles = schwab.get_price_history(
-                    symbol=symbol,
-                    period_type="day",
-                    period=1,
-                    frequency_type="minute",
-                    frequency=1,
-                )
-                opening_range = compute_opening_range(
-                    candles=candles,
-                    trade_date=now,
-                    market_open=market_open,
-                    range_end=range_end,
-                )
-                plan = build_orb_plan(symbol=symbol, opening_range=opening_range, target_points=target_points)
+                opening_range = tracker.opening_range()
+                if opening_range is None:
+                    raise RuntimeError("ORB range complete but opening_range is None")
 
-                logger.info(
-                    f"Opening range: high={opening_range.high:.2f} low={opening_range.low:.2f} size={opening_range.size:.2f}"
-                )
+                plan = build_orb_plan(symbol=symbol, opening_range=opening_range, target_points=target_points)
                 broker.place_oco_entry(buy_stop=plan.long_entry, sell_stop=plan.short_entry, qty=1)
                 oco_placed = True
+
                 # Stash plan values on broker for bracket attachment after fill
                 broker._orb_plan = plan  # type: ignore[attr-defined]
             except Exception as e:
-                logger.exception(f"Failed to compute opening range / place OCO: {e}
-Will retry.")
+                logger.exception(f"Failed to finalize ORB / place OCO: {e}; will retry")
 
         # Drive paper broker with price updates
         broker.on_price(last_price)
@@ -142,7 +137,7 @@ Will retry.")
             logger.info("EOD exit completed; shutting down")
             break
 
-        time_mod.sleep(2)
+        time_mod.sleep(tracker.poll_interval_s)
 
 
 if __name__ == "__main__":
