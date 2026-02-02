@@ -1,0 +1,47 @@
+# Kamal 2 deployment configuration
+# Docs: https://kamal-deploy.org/
+
+service: orb-trader
+
+# Update this to match your registry/repository.
+# Examples:
+#   image: yourdockerhubuser/orb-trader
+#   image: ghcr.io/your-org/orb-trader
+image: your-registry.example.com/orb-trader
+
+# This app is not a web server; disable the proxy and use the container's
+# Docker HEALTHCHECK (see Dockerfile) to determine readiness.
+primary_role: trader
+
+servers:
+  trader:
+    hosts:
+      - 0.0.0.0 # TODO: replace with your server IP
+    proxy: false
+
+# Persist logs + mount secrets file that lives on the server.
+# (Never bake secrets into the image.)
+volumes:
+  - /opt/orb-trader/config/secrets.yaml:/app/config/secrets.yaml:ro
+  - /opt/orb-trader/logs:/app/logs
+
+env:
+  clear:
+    TZ: America/New_York
+    HEALTH_PORT: "8000"
+
+# Registry credentials (set via environment variables or `kamal secrets`).
+registry:
+  server: your-registry.example.com # TODO
+  username:
+    - KAMAL_REGISTRY_USERNAME
+  password:
+    - KAMAL_REGISTRY_PASSWORD
+
+# Example: if you later change the app to read Schwab creds from env vars,
+# you can manage them via `kamal secrets` and list them here.
+# env:
+#   secret:
+#     - SCHWAB_CLIENT_ID
+#     - SCHWAB_CLIENT_SECRET
+#     - SCHWAB_REDIRECT_URI
