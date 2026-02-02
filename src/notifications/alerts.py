@@ -69,14 +69,49 @@ def format_entry(*, side: str, entry: float, stop: float, target: float) -> str:
     )
 
 
-def format_skip_day(*, reason: str, high: float, low: float) -> str:
+def format_skip_day(
+    *,
+    reason: str,
+    high: float,
+    low: float,
+    prev_close_high: Optional[float] = None,
+    prev_close_low: Optional[float] = None,
+    date_str: Optional[str] = None,
+) -> str:
     rng = float(high - low)
     reason_pretty = reason.replace("_", " ").title() if reason else "Skip Day"
-    return (
-        "⏸️ Standing down today\n"
-        f"Reason: {reason_pretty}\n"
-        f"Range captured: {high:.2f} - {low:.2f} ({rng:.2f} pts)"
-    )
+    
+    header = "⏸️ **Standing Down Today**"
+    if date_str:
+        header += f" ({date_str})"
+    
+    lines = [
+        header,
+        "",
+        f"**Reason:** {reason_pretty}",
+        "",
+    ]
+    
+    # For range overlap, show the comparison
+    if reason == "RANGE_OVERLAP_DAY" and prev_close_high and prev_close_low:
+        # Calculate overlap zone
+        overlap_low = max(low, prev_close_low)
+        overlap_high = min(high, prev_close_high)
+        
+        lines.extend([
+            f"Today's ORB: {low:.2f} - {high:.2f}",
+            f"Prev close: {prev_close_low:.2f} - {prev_close_high:.2f}",
+            f"Overlap zone: {overlap_low:.2f} - {overlap_high:.2f}",
+            "",
+            "Per strategy rules: When the opening range trades within yesterday's closing candle, we skip the day.",
+        ])
+    else:
+        lines.append(f"Range captured: {high:.2f} - {low:.2f} ({rng:.2f} pts)")
+    
+    lines.append("")
+    lines.append("No trade today. See you tomorrow! 📊")
+    
+    return "\n".join(lines)
 
 
 def format_exit(

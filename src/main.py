@@ -247,10 +247,16 @@ def main():
 
                     # Campfire: skip-day notice (best-effort)
                     try:
-                        opening_range = tracker.opening_range()
                         if opening_range is not None:
                             campfire.send_message(
-                                format_skip_day(reason=skip_reason, high=opening_range.high, low=opening_range.low)
+                                format_skip_day(
+                                    reason=skip_reason,
+                                    high=opening_range.high,
+                                    low=opening_range.low,
+                                    prev_close_high=prev_close_high,
+                                    prev_close_low=prev_close_low,
+                                    date_str=session_date.strftime("%b %-d"),
+                                )
                             )
                     except Exception as e:
                         logger.error(f"Campfire skip-day alert failed: {e}")
