@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import time as time_mod
 from dataclasses import dataclass
-from datetime import datetime, time
+from datetime import datetime, time, date as date_type
 from pathlib import Path
 
 import yaml
@@ -27,6 +27,8 @@ from src.strategy.orb import ORBTracker, ORBState
 from src.strategy.skip_days import should_skip_today
 from src.trading.paper import PaperBroker
 from src.utils.time_utils import is_past_time, now_eastern, parse_hhmm
+import pytz
+from datetime import timedelta
 
 
 @dataclass
@@ -43,6 +45,68 @@ class Settings:
 def load_settings(path: str = "config/settings.yaml") -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
+
+def get_prev_close_candle(schwab: SchwabClient, symbol: str, today: datetime.date):
+    """Get the previous trading day's last 15-min RTH candle.
+    
+    Returns (high, low) or (None, None) if unavailable.
+    """
+    try:
+        et = pytz.timezone('America/New_York')
+        
+        # Get 5 days of 15-min data
+        response = schwab.client.get_price_history(
+            symbol,
+            period_type=schwab.client.PriceHistory.PeriodType.DAY,
+            period=schwab.client.PriceHistory.Period.FIVE_DAYS,
+            frequency_type=schwab.client.PriceHistory.FrequencyType.MINUTE,
+            frequency=schwab.client.PriceHistory.Frequency.EVERY_FIFTEEN_MINUTES
+        )
+        
+        if response.status_code != 200:
+            logger.warning(f"Failed to get prev close candle: {response.text}")
+            return None, None
+        
+        import pandas as pd
+        data = response.json()
+        candles = data.get('candles', [])
+        if not candles:
+            return None, None
+        
+        df = pd.DataFrame(candles)
+        df['datetime'] = pd.to_datetime(df['datetime'], unit='ms')
+        df = df.set_index('datetime')
+        df = df.tz_localize('UTC').tz_convert(et)
+        
+        # Filter to RTH only (9:30-16:00)
+        def is_rth(dt):
+            t = dt.time()
+            return t >= time(9, 30) and t < time(16, 0)
+        
+        df_rth = df[df.index.map(is_rth)]
+        
+        # Find previous trading day (not today)
+        trading_days = sorted(set(df_rth.index.date))
+        prev_days = [d for d in trading_days if d < today]
+        
+        if not prev_days:
+            logger.warning("No previous trading day found in history")
+            return None, None
+        
+        prev_day = prev_days[-1]
+        prev_rth = df_rth[df_rth.index.date == prev_day]
+        
+        if len(prev_rth) == 0:
+            return None, None
+        
+        last_candle = prev_rth.iloc[-1]
+        logger.info(f"Prev close candle ({prev_day} 15:45): high={last_candle['high']} low={last_candle['low']}")
+        return float(last_candle['high']), float(last_candle['low'])
+        
+    except Exception as e:
+        logger.exception(f"Error getting prev close candle: {e}")
+        return None, None
 
 
 def load_secrets(path: str = "config/secrets.yaml") -> dict:
@@ -155,11 +219,23 @@ def main():
         if (not eod_done) and (not oco_placed) and state == ORBState.RANGE_COMPLETE and (not is_past_time(now, eod_exit)):
             # Evaluate skip-day conditions once/day right before we would trade.
             if not skip_evaluated:
+                # Get ORB range for overlap check
+                opening_range = tracker.opening_range()
+                orb_high = opening_range.high if opening_range else None
+                orb_low = opening_range.low if opening_range else None
+                
+                # Get previous trading day's closing 15-min candle
+                prev_close_high, prev_close_low = get_prev_close_candle(schwab, symbol, session_date)
+                
                 skip_today, skip_reason = should_skip_today(
                     day=session_date,
                     open_price=open_price,
                     prev_close=prev_close,
                     settings=settings,
+                    orb_high=orb_high,
+                    orb_low=orb_low,
+                    prev_close_high=prev_close_high,
+                    prev_close_low=prev_close_low,
                 )
                 skip_evaluated = True
 
