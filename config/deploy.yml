@@ -23,6 +23,8 @@ servers:
 # (Never bake secrets into the image.)
 volumes:
   - /opt/orb-trader/config/secrets.yaml:/app/config/secrets.yaml:ro
+  # Persist Schwab token between runs (avoid re-auth every deploy/restart).
+  - /opt/orb-trader/config/schwab_token.json:/app/config/schwab_token.json
   - /opt/orb-trader/logs:/app/logs
 
 env:
