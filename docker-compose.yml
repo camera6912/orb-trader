@@ -1,0 +1,13 @@
+services:
+  orb-trader:
+    build: .
+    container_name: orb-trader
+    environment:
+      TZ: America/New_York
+      HEALTH_PORT: "8000"
+    volumes:
+      # Secrets are NOT baked into the image.
+      - ./config/secrets.yaml:/app/config/secrets.yaml:ro
+      # Persist logs on the host.
+      - ./logs:/app/logs
+    restart: unless-stopped
