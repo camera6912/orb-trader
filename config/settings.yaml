@@ -5,7 +5,26 @@ be_check_time: "10:00"
 eod_exit: "16:00"
 target_points: 20
 entry_buffer_points: 0.25
-gap_threshold_pct: 1.0
+
+# Skip-day detection (Sprint 5)
+skip_days:
+  # Hardcoded list for now; can be replaced with a calendar source later.
+  fomc_dates_2026:
+    - "2026-01-29"
+    - "2026-03-19"
+    - "2026-05-07"
+    - "2026-06-18"
+    - "2026-07-30"
+    - "2026-09-17"
+    - "2026-11-05"
+    - "2026-12-17"
+
+  # If abs(today_open - prev_close) / prev_close * 100 > threshold, skip trading.
+  gap_threshold_pct: 1.0
+
+# Backwards-compat (deprecated): top-level threshold supported by should_skip_today()
+# gap_threshold_pct: 1.0
+
 campfire:
   url: "https://community.atradeortwo.com"
   room_id: 5

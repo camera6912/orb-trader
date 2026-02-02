@@ -1,0 +1,83 @@
+"""Skip-day detection helpers.
+
+The ORB strategy should avoid trading on certain days/conditions:
+- FOMC meeting days (configured list)
+- Large overnight gaps where price tends to mean-revert / fill the gap first
+
+This module keeps the logic isolated so it can be unit tested and evolved.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime
+from typing import Any, Iterable, Tuple
+
+
+def _as_date(d: Any) -> date:
+    if isinstance(d, date) and not isinstance(d, datetime):
+        return d
+    if isinstance(d, datetime):
+        return d.date()
+    if isinstance(d, str):
+        # Accept ISO date strings (YYYY-MM-DD)
+        return datetime.fromisoformat(d).date()
+    raise TypeError(f"Unsupported date type: {type(d)!r}")
+
+
+def is_fomc_day(day: date, fomc_dates: Iterable[str] | None = None) -> bool:
+    """Return True if `day` is in the configured list of FOMC dates."""
+    if not fomc_dates:
+        return False
+
+    d = _as_date(day)
+    iso = d.isoformat()
+    return any(str(x) == iso for x in fomc_dates)
+
+
+def is_gap_fill_day(open_price: float, prev_close: float, threshold_pct: float) -> bool:
+    """Return True if the overnight gap exceeds `threshold_pct`.
+
+    gap_pct = abs(open - prev_close) / prev_close * 100
+
+    Notes:
+    - If `prev_close` is 0 or missing, we cannot compute a meaningful gap.
+    """
+    if prev_close is None or prev_close <= 0:
+        return False
+    if open_price is None or open_price <= 0:
+        return False
+
+    gap_pct = abs(float(open_price) - float(prev_close)) / float(prev_close) * 100.0
+    return gap_pct > float(threshold_pct)
+
+
+def should_skip_today(
+    day: date,
+    open_price: float,
+    prev_close: float,
+    settings: dict,
+) -> Tuple[bool, str]:
+    """Evaluate all skip-day conditions.
+
+    Returns:
+        (skip, reason)
+
+    Reason is a short stable string suitable for logs.
+    """
+
+    cfg = (settings or {}).get("skip_days", {}) if isinstance(settings, dict) else {}
+
+    fomc_dates = cfg.get("fomc_dates_2026") or cfg.get("fomc_dates")
+    if is_fomc_day(day, fomc_dates=fomc_dates):
+        return True, "FOMC_DAY"
+
+    # Backwards-compatible: allow threshold at either settings.skip_days.gap_threshold_pct
+    # or top-level settings.gap_threshold_pct.
+    threshold_pct = cfg.get("gap_threshold_pct")
+    if threshold_pct is None:
+        threshold_pct = (settings or {}).get("gap_threshold_pct")
+
+    if threshold_pct is not None and is_gap_fill_day(open_price, prev_close, float(threshold_pct)):
+        return True, "GAP_FILL_DAY"
+
+    return False, ""

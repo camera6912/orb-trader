@@ -22,6 +22,7 @@ from loguru import logger
 
 from src.data.schwab import SchwabClient
 from src.strategy.orb import ORBTracker, ORBState
+from src.strategy.skip_days import should_skip_today
 from src.trading.paper import PaperBroker
 from src.utils.time_utils import is_past_time, now_eastern, parse_hhmm
 
@@ -80,6 +81,10 @@ def main():
     be_done = False
     eod_done = False
 
+    skip_evaluated = False
+    skip_today = False
+    skip_reason = ""
+
     session_date = now_eastern().date()
 
     while True:
@@ -106,10 +111,23 @@ def main():
             be_done = False
             eod_done = False
 
-        # Pull last price
+            skip_evaluated = False
+            skip_today = False
+            skip_reason = ""
+
+        # Pull quote + last price
         try:
-            q = schwab.get_es_quote() if symbol == "/ES" else schwab.get_quote(symbol)
-            last_price = float(q.get("price") if symbol == "/ES" else q.get(symbol, {}).get("quote", {}).get("lastPrice", 0.0))
+            if symbol == "/ES":
+                q = schwab.get_es_quote()
+                last_price = float(q.get("price", 0.0))
+                open_price = float(q.get("open", 0.0))
+                prev_close = float(q.get("close", 0.0))
+            else:
+                q = schwab.get_quote(symbol)
+                quote = q.get(symbol, {}).get("quote", {})
+                last_price = float(quote.get("lastPrice", 0.0))
+                open_price = float(quote.get("openPrice", 0.0))
+                prev_close = float(quote.get("closePrice", 0.0))
         except Exception as e:
             logger.exception(f"Quote error: {e}")
             time_mod.sleep(5)
@@ -120,22 +138,40 @@ def main():
 
         # Once the range is complete, build plan + place OCO exactly once (and only before EOD)
         if (not eod_done) and (not oco_placed) and state == ORBState.RANGE_COMPLETE and (not is_past_time(now, eod_exit)):
-            try:
-                opening_range = tracker.opening_range()
-                if opening_range is None:
-                    raise RuntimeError("ORB range complete but opening_range is None")
-
-                broker.place_orb_oco(
-                    range_high=opening_range.high,
-                    range_low=opening_range.low,
-                    buffer=buffer_points,
-                    target_points=target_points,
-                    qty=1,
-                    now=now,
+            # Evaluate skip-day conditions once/day right before we would trade.
+            if not skip_evaluated:
+                skip_today, skip_reason = should_skip_today(
+                    day=session_date,
+                    open_price=open_price,
+                    prev_close=prev_close,
+                    settings=settings,
                 )
-                oco_placed = True
-            except Exception as e:
-                logger.exception(f"Failed to finalize ORB / place OCO: {e}; will retry")
+                skip_evaluated = True
+
+                if skip_today:
+                    logger.warning(
+                        f"Skip day detected ({skip_reason}); standing down. "
+                        f"open={open_price} prev_close={prev_close}"
+                    )
+                    oco_placed = True  # prevent retries for the rest of the session
+
+            if (not skip_today) and (not oco_placed):
+                try:
+                    opening_range = tracker.opening_range()
+                    if opening_range is None:
+                        raise RuntimeError("ORB range complete but opening_range is None")
+
+                    broker.place_orb_oco(
+                        range_high=opening_range.high,
+                        range_low=opening_range.low,
+                        buffer=buffer_points,
+                        target_points=target_points,
+                        qty=1,
+                        now=now,
+                    )
+                    oco_placed = True
+                except Exception as e:
+                    logger.exception(f"Failed to finalize ORB / place OCO: {e}; will retry")
 
         # Drive paper broker with price updates
         broker.on_price(last_price, now=now)
