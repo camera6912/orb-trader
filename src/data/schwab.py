@@ -203,9 +203,9 @@ class SchwabClient:
         response = self.client.get_price_history(
             symbol=symbol,
             period_type=getattr(self.client.PriceHistory.PeriodType, period_type.upper()),
-            period=getattr(self.client.PriceHistory.Period, f'_{period}' if period < 10 else str(period)),
+            period=self.client.PriceHistory.Period.ONE_DAY,  # Always use 1 day for intraday
             frequency_type=getattr(self.client.PriceHistory.FrequencyType, frequency_type.upper()),
-            frequency=getattr(self.client.PriceHistory.Frequency, f'EVERY_{frequency}_MINUTES' if frequency_type == 'minute' else str(frequency))
+            frequency=self.client.PriceHistory.Frequency.EVERY_MINUTE if frequency == 1 else self.client.PriceHistory.Frequency.EVERY_FIVE_MINUTES
         )
         
         if response.status_code != 200:
