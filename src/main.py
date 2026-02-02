@@ -12,6 +12,8 @@ order routing later.
 
 from __future__ import annotations
 
+import os
+import threading
 import time as time_mod
 from dataclasses import dataclass
 from datetime import datetime, time, date as date_type
@@ -122,9 +124,49 @@ def _t(hhmm: str) -> time:
     return parse_hhmm(hhmm)
 
 
+def start_health_server(host: str = "0.0.0.0", port: int = 8000) -> None:
+    """Start a tiny HTTP server for container health checks.
+
+    Responds 200 OK on /health.
+    """
+
+    try:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                if self.path == "/health":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/plain")
+                    self.end_headers()
+                    self.wfile.write(b"ok")
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):  # noqa: A002
+                # Silence default HTTP request logging.
+                return
+
+        httpd = HTTPServer((host, port), Handler)
+
+        thread = threading.Thread(target=httpd.serve_forever, name="health-server", daemon=True)
+        thread.start()
+        logger.info(f"Health server listening on http://{host}:{port}/health")
+    except Exception as e:
+        logger.warning(f"Failed to start health server: {e}")
+
+
 def main():
     settings = load_settings()
     secrets = load_secrets()
+
+    # Used by Docker/Kamal healthcheck (optional).
+    try:
+        health_port = int(os.getenv("HEALTH_PORT", "8000"))
+        start_health_server(port=health_port)
+    except Exception as e:
+        logger.warning(f"Health server disabled: {e}")
 
     symbol = settings["symbol"]
     market_open = settings["market_open"]
