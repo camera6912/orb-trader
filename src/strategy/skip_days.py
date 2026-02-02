@@ -34,6 +34,27 @@ def is_fomc_day(day: date, fomc_dates: Iterable[str] | None = None) -> bool:
     return any(str(x) == iso for x in fomc_dates)
 
 
+def is_range_overlap_day(
+    orb_high: float,
+    orb_low: float,
+    prev_close_high: float,
+    prev_close_low: float,
+) -> bool:
+    """Return True if today's ORB overlaps with yesterday's closing candle range.
+    
+    Per the ebook: If today's opening 15-min candle trades within the range of
+    yesterday's closing 15-min candle, skip the day.
+    
+    Overlap = any intersection between the two ranges.
+    """
+    if any(v is None or v <= 0 for v in [orb_high, orb_low, prev_close_high, prev_close_low]):
+        return False
+    
+    # No overlap if ORB is completely above or below prev close range
+    no_overlap = orb_high < prev_close_low or orb_low > prev_close_high
+    return not no_overlap
+
+
 def is_gap_fill_day(open_price: float, prev_close: float, threshold_pct: float) -> bool:
     """Return True if the overnight gap exceeds `threshold_pct`.
 
@@ -56,6 +77,10 @@ def should_skip_today(
     open_price: float,
     prev_close: float,
     settings: dict,
+    orb_high: float = None,
+    orb_low: float = None,
+    prev_close_high: float = None,
+    prev_close_low: float = None,
 ) -> Tuple[bool, str]:
     """Evaluate all skip-day conditions.
 
@@ -63,6 +88,11 @@ def should_skip_today(
         (skip, reason)
 
     Reason is a short stable string suitable for logs.
+    
+    Skip conditions:
+    1. FOMC day (from config list)
+    2. Gap-fill day (overnight gap > threshold)
+    3. Range overlap day (ORB overlaps prev close candle)
     """
 
     cfg = (settings or {}).get("skip_days", {}) if isinstance(settings, dict) else {}
@@ -79,5 +109,10 @@ def should_skip_today(
 
     if threshold_pct is not None and is_gap_fill_day(open_price, prev_close, float(threshold_pct)):
         return True, "GAP_FILL_DAY"
+
+    # Range overlap check (ebook rule: ORB within prev close candle = skip)
+    if all(v is not None for v in [orb_high, orb_low, prev_close_high, prev_close_low]):
+        if is_range_overlap_day(orb_high, orb_low, prev_close_high, prev_close_low):
+            return True, "RANGE_OVERLAP_DAY"
 
     return False, ""
