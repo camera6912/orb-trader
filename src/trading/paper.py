@@ -74,6 +74,9 @@ class PaperBroker:
 
         self.trade_taken_today: bool = False
 
+        # Tracks whether we've moved the active stop to breakeven for this trade.
+        self._breakeven_stop_active: bool = False
+
         self._last_price: Optional[float] = None
         self._last_unrealized_pnl: Optional[float] = None
 
@@ -121,6 +124,20 @@ class PaperBroker:
             logger.info(f"Canceled pending OCO entry (reason={reason})")
         self.oco = None
 
+    def reset_for_new_day(self, *, reason: str = "DAILY_RESET"):
+        """Clear all intraday state so we're ready for the next session."""
+        if self.position or self.bracket:
+            logger.warning(f"Resetting broker state with an open position (reason={reason})")
+        if self.oco is not None:
+            logger.info(f"Clearing pending OCO entry (reason={reason})")
+        self.position = None
+        self.bracket = None
+        self.oco = None
+        self.trade_taken_today = False
+        self._breakeven_stop_active = False
+        self._last_price = None
+        self._last_unrealized_pnl = None
+
     def on_price(self, price: float, now: Optional[datetime] = None):
         """Call this with latest trade/last price."""
         ts = now or datetime.now(tz=pytz.timezone("US/Eastern"))
@@ -165,37 +182,51 @@ class PaperBroker:
         if self.position and self.bracket:
             if self.position.side == Side.LONG:
                 if price <= self.bracket.stop:
-                    self._close(price, reason="STOP", now=ts)
+                    self._close(price, reason="stop", now=ts)
                 elif price >= self.bracket.target:
-                    self._close(price, reason="TARGET", now=ts)
+                    self._close(price, reason="target", now=ts)
             else:
                 if price >= self.bracket.stop:
-                    self._close(price, reason="STOP", now=ts)
+                    self._close(price, reason="stop", now=ts)
                 elif price <= self.bracket.target:
-                    self._close(price, reason="TARGET", now=ts)
+                    self._close(price, reason="target", now=ts)
 
             # P&L logging (throttled)
             self._log_unrealized_pnl(price)
 
         self._last_price = float(price)
 
-    def move_stop_to_breakeven_if_in_profit(self, last_price: float):
+    def move_stop_to_breakeven_if_in_profit(self, last_price: float, *, now: Optional[datetime] = None):
+        ts = now or datetime.now(tz=pytz.timezone("US/Eastern"))
         if not self.position or not self.bracket:
             return
+        if self._breakeven_stop_active:
+            return
+
         if self.position.side == Side.LONG and last_price > self.position.entry:
             if self.bracket.stop < self.position.entry:
                 self.bracket.stop = self.position.entry
-                logger.info(f"Moved stop to breakeven: {self.bracket.stop:.2f}")
+                self._breakeven_stop_active = True
+                logger.info(
+                    f"Breakeven check: moved stop to breakeven @ {self.bracket.stop:.2f} "
+                    f"(entry={self.position.entry:.2f} last={last_price:.2f} time={ts.isoformat()})"
+                )
         elif self.position.side == Side.SHORT and last_price < self.position.entry:
             if self.bracket.stop > self.position.entry:
                 self.bracket.stop = self.position.entry
-                logger.info(f"Moved stop to breakeven: {self.bracket.stop:.2f}")
+                self._breakeven_stop_active = True
+                logger.info(
+                    f"Breakeven check: moved stop to breakeven @ {self.bracket.stop:.2f} "
+                    f"(entry={self.position.entry:.2f} last={last_price:.2f} time={ts.isoformat()})"
+                )
 
-    def exit_market(self, last_price: float, reason: str = "EOD", now: Optional[datetime] = None):
+    def exit_market(self, last_price: float, reason: str = "eod", now: Optional[datetime] = None):
+        """Exit any open position at market and cancel any unfilled entry orders."""
         ts = now or datetime.now(tz=pytz.timezone("US/Eastern"))
         if self.position:
             self._close(last_price, reason=reason, now=ts)
-        self.oco = None
+        if self.oco is not None:
+            self.cancel_entry(reason=reason)
 
     def _compute_stop_target(self, side: Side, entry: float, oco: OCOEntry) -> tuple[float, float]:
         # Target: fixed points from entry
@@ -230,16 +261,30 @@ class PaperBroker:
 
         # Reset unrealized PnL throttle
         self._last_unrealized_pnl = None
+        self._breakeven_stop_active = False
 
     def _close(self, price: float, reason: str, now: datetime):
         assert self.position is not None
         pnl = (price - self.position.entry) * (1 if self.position.side == Side.LONG else -1)
+        # Normalize exit reasons for downstream reporting.
+        exit_reason = reason
+        if reason == "stop" and self._breakeven_stop_active and self.bracket is not None:
+            # If we moved the stop up/down to entry, a subsequent stop-out is a breakeven exit.
+            if abs(self.bracket.stop - self.position.entry) < 1e-9:
+                exit_reason = "breakeven_stop"
+
+        duration_s = (now - self.position.entry_time).total_seconds()
+
         logger.info(
             f"CLOSE {self.position.side} qty={self.position.qty} exit={price:.2f} "
-            f"PnL={pnl:.2f} reason={reason} (exit_time={now.isoformat()})"
+            f"PnL={pnl:.2f} exit_reason={exit_reason} "
+            f"duration_s={duration_s:.0f} "
+            f"(entry_time={self.position.entry_time.isoformat()} exit_time={now.isoformat()})"
         )
+
         self.position = None
         self.bracket = None
+        self._breakeven_stop_active = False
         self._last_unrealized_pnl = None
 
     def _log_unrealized_pnl(self, last_price: float, min_change: float = 1.0):

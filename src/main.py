@@ -17,13 +17,13 @@ from dataclasses import dataclass
 from datetime import datetime, time
 from pathlib import Path
 
-import pytz
 import yaml
 from loguru import logger
 
 from src.data.schwab import SchwabClient
 from src.strategy.orb import ORBTracker, ORBState
 from src.trading.paper import PaperBroker
+from src.utils.time_utils import is_past_time, now_eastern, parse_hhmm
 
 
 @dataclass
@@ -43,11 +43,8 @@ def load_settings(path: str = "config/settings.yaml") -> dict:
 
 
 def _t(hhmm: str) -> time:
-    return time.fromisoformat(hhmm)
-
-
-def _now_eastern() -> datetime:
-    return datetime.now(tz=pytz.timezone("US/Eastern"))
+    # Backwards-compatible shim (main loop uses shared util helpers now).
+    return parse_hhmm(hhmm)
 
 
 def main():
@@ -81,10 +78,33 @@ def main():
 
     oco_placed = False
     be_done = False
+    eod_done = False
+
+    session_date = now_eastern().date()
 
     while True:
-        now = _now_eastern()
+        now = now_eastern()
         t = now.time()
+
+        # Daily reset (midnight ET): clear one-trade-per-day, OCO placement flags,
+        # and reinitialize the ORB tracker for the new session.
+        if now.date() != session_date:
+            logger.info(f"New session date detected: {session_date} -> {now.date()} (resetting)")
+            session_date = now.date()
+
+            broker.reset_for_new_day(reason="NEW_DAY")
+            tracker = ORBTracker(
+                schwab_client=schwab,
+                symbol=symbol,
+                market_open=market_open,
+                range_end=range_end,
+                tz="America/New_York",
+                poll_interval_s=2.0,
+                max_stale_s=30,
+            )
+            oco_placed = False
+            be_done = False
+            eod_done = False
 
         # Pull last price
         try:
@@ -98,8 +118,8 @@ def main():
         # Drive ORB tracker state machine (handles seeding from history + live polling)
         state = tracker.update(now)
 
-        # Once the range is complete, build plan + place OCO exactly once
-        if (not oco_placed) and state == ORBState.RANGE_COMPLETE:
+        # Once the range is complete, build plan + place OCO exactly once (and only before EOD)
+        if (not eod_done) and (not oco_placed) and state == ORBState.RANGE_COMPLETE and (not is_past_time(now, eod_exit)):
             try:
                 opening_range = tracker.opening_range()
                 if opening_range is None:
@@ -120,16 +140,21 @@ def main():
         # Drive paper broker with price updates
         broker.on_price(last_price, now=now)
 
-        # Breakeven check at configured time
-        if (not be_done) and t >= _t(be_check_time):
-            broker.move_stop_to_breakeven_if_in_profit(last_price)
+        # Breakeven check at configured time (once per day)
+        if (not be_done) and is_past_time(now, be_check_time):
+            broker.move_stop_to_breakeven_if_in_profit(last_price, now=now)
             be_done = True
 
-        # EOD exit
-        if t >= _t(eod_exit):
-            broker.exit_market(last_price, reason="EOD", now=now)
-            logger.info("EOD exit completed; shutting down")
-            break
+        # EOD exit (once per day): close any open position + cancel any unfilled OCO
+        if (not eod_done) and is_past_time(now, eod_exit):
+            broker.exit_market(last_price, reason="eod", now=now)
+            logger.info("EOD exit processed; resetting for next day")
+
+            # Clear intraday state so we're ready for the next range capture.
+            broker.reset_for_new_day(reason="EOD")
+            oco_placed = False
+            be_done = False
+            eod_done = True
 
         time_mod.sleep(tracker.poll_interval_s)
 
