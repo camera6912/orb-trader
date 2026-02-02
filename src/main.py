@@ -21,6 +21,8 @@ import yaml
 from loguru import logger
 
 from src.data.schwab import SchwabClient
+from src.notifications.alerts import format_range_set, format_skip_day
+from src.notifications.campfire import notifier_from_config
 from src.strategy.orb import ORBTracker, ORBState
 from src.strategy.skip_days import should_skip_today
 from src.trading.paper import PaperBroker
@@ -43,6 +45,14 @@ def load_settings(path: str = "config/settings.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def load_secrets(path: str = "config/secrets.yaml") -> dict:
+    try:
+        with open(path) as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+
 def _t(hhmm: str) -> time:
     # Backwards-compatible shim (main loop uses shared util helpers now).
     return parse_hhmm(hhmm)
@@ -50,6 +60,7 @@ def _t(hhmm: str) -> time:
 
 def main():
     settings = load_settings()
+    secrets = load_secrets()
 
     symbol = settings["symbol"]
     market_open = settings["market_open"]
@@ -65,7 +76,11 @@ def main():
     if not schwab.authenticate(interactive=True):
         raise SystemExit(1)
 
-    broker = PaperBroker()
+    campfire = notifier_from_config(settings, secrets)
+
+    # ES point value is $50/point. If we support other symbols later, make this configurable.
+    point_value = 50.0 if symbol == "/ES" else 1.0
+    broker = PaperBroker(notifier=campfire, symbol=symbol, point_value=point_value)
 
     tracker = ORBTracker(
         schwab_client=schwab,
@@ -153,6 +168,17 @@ def main():
                         f"Skip day detected ({skip_reason}); standing down. "
                         f"open={open_price} prev_close={prev_close}"
                     )
+
+                    # Campfire: skip-day notice (best-effort)
+                    try:
+                        opening_range = tracker.opening_range()
+                        if opening_range is not None:
+                            campfire.send_message(
+                                format_skip_day(reason=skip_reason, high=opening_range.high, low=opening_range.low)
+                            )
+                    except Exception as e:
+                        logger.error(f"Campfire skip-day alert failed: {e}")
+
                     oco_placed = True  # prevent retries for the rest of the session
 
             if (not skip_today) and (not oco_placed):
@@ -169,6 +195,23 @@ def main():
                         qty=1,
                         now=now,
                     )
+
+                    # Campfire: range established / OCO placed (best-effort)
+                    try:
+                        buy_stop = float(opening_range.high + buffer_points)
+                        sell_stop = float(opening_range.low - buffer_points)
+                        campfire.send_message(
+                            format_range_set(
+                                high=opening_range.high,
+                                low=opening_range.low,
+                                buy_stop=buy_stop,
+                                sell_stop=sell_stop,
+                                range_end_time=now,
+                            )
+                        )
+                    except Exception as e:
+                        logger.error(f"Campfire range alert failed: {e}")
+
                     oco_placed = True
                 except Exception as e:
                     logger.exception(f"Failed to finalize ORB / place OCO: {e}; will retry")

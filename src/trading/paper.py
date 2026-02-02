@@ -25,6 +25,8 @@ from typing import Optional
 import pytz
 from loguru import logger
 
+from src.notifications.alerts import ExitSummary, format_entry, format_exit
+
 
 class Side(str, Enum):
     LONG = "LONG"
@@ -67,7 +69,18 @@ class OCOEntry:
 
 
 class PaperBroker:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        notifier=None,
+        symbol: str = "/ES",
+        point_value: float = 50.0,
+    ):
+        # notifier: object with .send_message(str) -> bool
+        self.notifier = notifier
+        self.symbol = symbol
+        self.point_value = float(point_value)
+
         self.position: Optional[Position] = None
         self.bracket: Optional[Bracket] = None
         self.oco: Optional[OCOEntry] = None
@@ -259,6 +272,14 @@ class PaperBroker:
             f"(entry_time={now.isoformat()})"
         )
 
+        # Community alert (best-effort)
+        if self.notifier is not None:
+            try:
+                msg = format_entry(side=side.value, entry=float(entry), stop=float(stop), target=float(target))
+                self.notifier.send_message(msg)
+            except Exception as e:
+                logger.error(f"Campfire entry alert failed: {e}")
+
         # Reset unrealized PnL throttle
         self._last_unrealized_pnl = None
         self._breakeven_stop_active = False
@@ -281,6 +302,26 @@ class PaperBroker:
             f"duration_s={duration_s:.0f} "
             f"(entry_time={self.position.entry_time.isoformat()} exit_time={now.isoformat()})"
         )
+
+        # Community alert (best-effort)
+        if self.notifier is not None:
+            try:
+                dollars = pnl * self.point_value * float(self.position.qty)
+                summary = ExitSummary(
+                    exit_reason=exit_reason,
+                    pnl_points=float(pnl),
+                    pnl_dollars=float(dollars),
+                    duration_s=float(duration_s),
+                )
+                msg = format_exit(
+                    side=self.position.side.value,
+                    entry=float(self.position.entry),
+                    exit_price=float(price),
+                    summary=summary,
+                )
+                self.notifier.send_message(msg)
+            except Exception as e:
+                logger.error(f"Campfire exit alert failed: {e}")
 
         self.position = None
         self.bracket = None

@@ -1,16 +1,9 @@
-"""
-Campfire Chat Integration - Post trade alerts to ATAT Campfire
+"""Campfire Chat Integration.
 
-Usage:
-    from src.notifications.campfire import CampfireNotifier
-    
-    notifier = CampfireNotifier(
-        base_url="https://community.atradeortwo.com",
-        room_id="5",
-        bot_key="9-QiPGzPSpJBcB"
-    )
-    notifier.send_message("Hello from the bot!")
-    notifier.send_trade_alert(side="SHORT", entry=7002.50, stop=7017.25, target=6950.00)
+This module intentionally stays thin: it only knows how to POST messages to a
+Campfire room via the bot endpoint.
+
+Trading logic should construct messages elsewhere (see `src/notifications/alerts.py`).
 """
 
 import requests
@@ -25,7 +18,7 @@ class CampfireNotifier:
         self.base_url = base_url.rstrip('/')
         self.room_id = room_id
         self.bot_key = bot_key
-        self.enabled = bool(bot_key)
+        self.enabled = bool(bot_key and self.base_url and self.room_id)
     
     @property
     def endpoint(self) -> str:
@@ -173,31 +166,47 @@ class CampfireNotifier:
         return self.send_message(message)
 
 
-# Default instance for ATAT Campfire
-def get_campfire_notifier(enabled: bool = False) -> CampfireNotifier:
+def notifier_from_config(settings: dict | None, secrets: dict | None = None) -> CampfireNotifier:
+    """Build a Campfire notifier from config dicts.
+
+    Expected settings:
+      settings.campfire.url
+      settings.campfire.room_id
+
+    Expected secrets (recommended, do not commit):
+      secrets.campfire.bot_key  (or campfire.api_token)
+
+    If no bot key is present, returns a disabled notifier.
     """
-    Get the default Campfire notifier for ATAT community.
-    
-    NOTE: Disabled by default as of 2026-02-02.
-    The SPX Trendy Edge bot alerts are for Jon privately.
-    ORB alerts (separate bot) go to Campfire.
-    """
-    if not enabled:
-        # Return a disabled notifier (empty bot_key)
-        return CampfireNotifier(
-            base_url="https://community.atradeortwo.com",
-            room_id="5",
-            bot_key=""  # Disabled
-        )
-    
+
+    s = settings or {}
+    camp = (s.get("campfire") or {}) if isinstance(s, dict) else {}
+
+    base_url = str(camp.get("url") or "").strip()
+    room_id = str(camp.get("room_id") or "").strip()
+
+    sec = secrets or {}
+    sec_camp = (sec.get("campfire") or {}) if isinstance(sec, dict) else {}
+    bot_key = str(sec_camp.get("bot_key") or sec_camp.get("api_token") or "").strip()
+
     return CampfireNotifier(
-        base_url="https://community.atradeortwo.com",
-        room_id="5",
-        bot_key="9-QiPGzPSpJBcB"
+        base_url=base_url,
+        room_id=room_id,
+        bot_key=bot_key,
     )
 
 
 if __name__ == "__main__":
-    # Test the notifier
-    notifier = get_campfire_notifier()
-    notifier.send_message("🧪 Test message from Trixie trading bot")
+    # Minimal smoke test (requires secrets.yaml populated with campfire.bot_key)
+    import yaml
+
+    with open("config/settings.yaml") as f:
+        settings = yaml.safe_load(f)
+    try:
+        with open("config/secrets.yaml") as f:
+            secrets = yaml.safe_load(f)
+    except FileNotFoundError:
+        secrets = {}
+
+    notifier = notifier_from_config(settings, secrets)
+    notifier.send_message("🧪 Test message from ORB trader")
