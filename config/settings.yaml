@@ -4,6 +4,7 @@ range_end: "09:45"
 be_check_time: "10:00"
 eod_exit: "16:00"
 target_points: 20
+entry_buffer_points: 0.25
 gap_threshold_pct: 1.0
 campfire:
   url: "https://community.atradeortwo.com"

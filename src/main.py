@@ -22,7 +22,7 @@ import yaml
 from loguru import logger
 
 from src.data.schwab import SchwabClient
-from src.strategy.orb import ORBTracker, ORBState, build_orb_plan
+from src.strategy.orb import ORBTracker, ORBState
 from src.trading.paper import PaperBroker
 
 
@@ -59,6 +59,7 @@ def main():
     be_check_time = settings["be_check_time"]
     eod_exit = settings["eod_exit"]
     target_points = float(settings["target_points"])
+    buffer_points = float(settings.get("entry_buffer_points", 0.25))
 
     logger.add("logs/orb-trader.log", rotation="1 day", retention="14 days")
 
@@ -79,7 +80,6 @@ def main():
     )
 
     oco_placed = False
-    bracket_attached = False
     be_done = False
 
     while True:
@@ -105,26 +105,20 @@ def main():
                 if opening_range is None:
                     raise RuntimeError("ORB range complete but opening_range is None")
 
-                plan = build_orb_plan(symbol=symbol, opening_range=opening_range, target_points=target_points)
-                broker.place_oco_entry(buy_stop=plan.long_entry, sell_stop=plan.short_entry, qty=1)
+                broker.place_orb_oco(
+                    range_high=opening_range.high,
+                    range_low=opening_range.low,
+                    buffer=buffer_points,
+                    target_points=target_points,
+                    qty=1,
+                    now=now,
+                )
                 oco_placed = True
-
-                # Stash plan values on broker for bracket attachment after fill
-                broker._orb_plan = plan  # type: ignore[attr-defined]
             except Exception as e:
                 logger.exception(f"Failed to finalize ORB / place OCO: {e}; will retry")
 
         # Drive paper broker with price updates
-        broker.on_price(last_price)
-
-        # Attach bracket immediately after fill
-        if broker.position and (not bracket_attached) and hasattr(broker, "_orb_plan"):
-            plan = broker._orb_plan  # type: ignore[attr-defined]
-            if broker.position.side.value == "LONG":
-                broker.attach_bracket(stop=plan.long_stop, target=plan.long_target)
-            else:
-                broker.attach_bracket(stop=plan.short_stop, target=plan.short_target)
-            bracket_attached = True
+        broker.on_price(last_price, now=now)
 
         # Breakeven check at configured time
         if (not be_done) and t >= _t(be_check_time):
@@ -133,7 +127,7 @@ def main():
 
         # EOD exit
         if t >= _t(eod_exit):
-            broker.exit_market(last_price, reason="EOD")
+            broker.exit_market(last_price, reason="EOD", now=now)
             logger.info("EOD exit completed; shutting down")
             break
 
