@@ -28,6 +28,7 @@ from src.notifications.campfire import notifier_from_config
 from src.strategy.orb import ORBTracker, ORBState
 from src.strategy.skip_days import should_skip_today
 from src.trading.paper import PaperBroker
+from src.utils.price_utils import round_to_tick
 from src.utils.time_utils import is_past_time, now_eastern, parse_hhmm
 import pytz
 from datetime import timedelta
@@ -322,8 +323,8 @@ def main():
 
                     # Campfire: range established / OCO placed (best-effort)
                     try:
-                        buy_stop = float(opening_range.high + buffer_points)
-                        sell_stop = float(opening_range.low - buffer_points)
+                        buy_stop = round_to_tick(float(opening_range.high + buffer_points), tick_size=0.25, direction="up")
+                        sell_stop = round_to_tick(float(opening_range.low - buffer_points), tick_size=0.25, direction="down")
                         campfire.send_message(
                             format_range_set(
                                 high=opening_range.high,

@@ -25,6 +25,8 @@ from typing import Optional
 import pytz
 from loguru import logger
 
+from src.utils.price_utils import round_to_tick
+
 from src.notifications.alerts import ExitSummary, format_entry, format_exit
 
 
@@ -109,8 +111,11 @@ class PaperBroker:
             logger.warning("One-trade-per-day rule: refusing to place new entry")
             return
 
-        buy_stop = float(range_high + buffer)
-        sell_stop = float(range_low - buffer)
+        # Entry stop orders must be on a valid tick.
+        # LONG entry triggers above range_high: round UP (don’t accidentally place inside the range).
+        # SHORT entry triggers below range_low: round DOWN.
+        buy_stop = round_to_tick(float(range_high + buffer), tick_size=0.25, direction="up")
+        sell_stop = round_to_tick(float(range_low - buffer), tick_size=0.25, direction="down")
         range_size = float(range_high - range_low)
         range_mid = float((range_high + range_low) / 2.0)
         ts = now or datetime.now(tz=pytz.timezone("US/Eastern"))
@@ -218,7 +223,8 @@ class PaperBroker:
 
         if self.position.side == Side.LONG and last_price > self.position.entry:
             if self.bracket.stop < self.position.entry:
-                self.bracket.stop = self.position.entry
+                # LONG stop rounds DOWN (conservative/wider)
+                self.bracket.stop = round_to_tick(self.position.entry, tick_size=0.25, direction="down")
                 self._breakeven_stop_active = True
                 logger.info(
                     f"Breakeven check: moved stop to breakeven @ {self.bracket.stop:.2f} "
@@ -226,7 +232,8 @@ class PaperBroker:
                 )
         elif self.position.side == Side.SHORT and last_price < self.position.entry:
             if self.bracket.stop > self.position.entry:
-                self.bracket.stop = self.position.entry
+                # SHORT stop rounds UP (conservative/wider)
+                self.bracket.stop = round_to_tick(self.position.entry, tick_size=0.25, direction="up")
                 self._breakeven_stop_active = True
                 logger.info(
                     f"Breakeven check: moved stop to breakeven @ {self.bracket.stop:.2f} "
@@ -247,11 +254,18 @@ class PaperBroker:
 
         # Stop: opposite end of range, unless range > target_points → midpoint
         if oco.range_size > oco.target_points:
-            stop = float(oco.range_mid)
+            stop_raw = float(oco.range_mid)
         else:
-            stop = float(oco.range_low) if side == Side.LONG else float(oco.range_high)
+            stop_raw = float(oco.range_low) if side == Side.LONG else float(oco.range_high)
 
-        return stop, target
+        # /ES tick rounding (conservative/wider):
+        #   LONG stop rounds DOWN; SHORT stop rounds UP.
+        if side == Side.LONG:
+            stop = round_to_tick(stop_raw, tick_size=0.25, direction="down")
+        else:
+            stop = round_to_tick(stop_raw, tick_size=0.25, direction="up")
+
+        return float(stop), target
 
     def _open(self, side: Side, qty: int, entry: float, now: datetime):
         self.trade_taken_today = True

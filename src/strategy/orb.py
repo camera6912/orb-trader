@@ -17,6 +17,8 @@ import pandas as pd
 import pytz
 from loguru import logger
 
+from src.utils.price_utils import es_tick_size, round_to_tick
+
 
 @dataclass(frozen=True)
 class OpeningRange:
@@ -322,6 +324,10 @@ def build_orb_plan(
       - Entries at range boundaries.
       - Target is fixed target_points.
       - Stop is opposite side of range, OR midpoint if the range > target_points.
+
+    Note: /ES trades in 0.25-point ticks. Stops must be rounded to a valid tick.
+      - LONG stop: round DOWN to nearest tick (slightly wider / conservative)
+      - SHORT stop: round UP to nearest tick (slightly wider / conservative)
     """
 
     rng = opening_range.size
@@ -332,11 +338,19 @@ def build_orb_plan(
     short_entry = opening_range.low
 
     if use_mid_stop:
-        long_stop = float(stop_level)
-        short_stop = float(stop_level)
+        long_stop_raw = float(stop_level)
+        short_stop_raw = float(stop_level)
     else:
-        long_stop = opening_range.low
-        short_stop = opening_range.high
+        long_stop_raw = float(opening_range.low)
+        short_stop_raw = float(opening_range.high)
+
+    tick = es_tick_size(symbol)
+    if symbol in {"/ES", "/MES"}:
+        long_stop = round_to_tick(long_stop_raw, tick_size=tick, direction="down")
+        short_stop = round_to_tick(short_stop_raw, tick_size=tick, direction="up")
+    else:
+        long_stop = long_stop_raw
+        short_stop = short_stop_raw
 
     long_target = float(long_entry + target_points)
     short_target = float(short_entry - target_points)
