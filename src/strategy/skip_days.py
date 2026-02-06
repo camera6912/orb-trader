@@ -55,6 +55,17 @@ def is_range_overlap_day(
     return not no_overlap
 
 
+def is_wide_range_day(range_size: float, max_range_points: float = 38.0) -> bool:
+    """Return True if the ORB range exceeds the maximum allowed size.
+    
+    Per Jon: If the 9:30-9:45 range is greater than 38 points, skip the day.
+    Wide ranges = high volatility = unpredictable breakouts.
+    """
+    if range_size is None or range_size <= 0:
+        return False
+    return range_size > max_range_points
+
+
 def is_gap_fill_day(open_price: float, prev_close: float, threshold_pct: float) -> bool:
     """Return True if the overnight gap exceeds `threshold_pct`.
 
@@ -93,6 +104,7 @@ def should_skip_today(
     1. FOMC day (from config list)
     2. Gap-fill day (overnight gap > threshold)
     3. Range overlap day (ORB overlaps prev close candle)
+    4. Wide range day (ORB > 38 points)
     """
 
     cfg = (settings or {}).get("skip_days", {}) if isinstance(settings, dict) else {}
@@ -114,5 +126,12 @@ def should_skip_today(
     if all(v is not None for v in [orb_high, orb_low, prev_close_high, prev_close_low]):
         if is_range_overlap_day(orb_high, orb_low, prev_close_high, prev_close_low):
             return True, "RANGE_OVERLAP_DAY"
+
+    # Wide range check: ORB > 38 points = too volatile
+    if orb_high is not None and orb_low is not None:
+        range_size = orb_high - orb_low
+        max_range = cfg.get("max_range_points", 38.0)
+        if is_wide_range_day(range_size, max_range):
+            return True, "WIDE_RANGE_DAY"
 
     return False, ""
